@@ -1,6 +1,30 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { CharacterLines } from "@/components/CharacterLines";
+import { CharacterInfoPanel } from "@/components/CharacterInfoPanel";
+import { CharacterLegend } from "@/components/CharacterLegend";
+import { EditorPanel } from "@/components/EditorPanel";
+import { MapControls } from "@/components/MapControls";
+import type { EditorOverrides, TimelineMode } from "@/data/types";
+import {
+  buildBoardData,
+  EMPTY_OVERRIDES,
+  filterBoardItems,
+  loadEditorOverrides,
+  saveEditorOverrides,
+} from "@/lib/boardData";
+import {
+  buildCardRects,
+  formatCardCaption,
+  getItemX,
+  getItemY,
+  sortItems,
+  TIMELINE_Y,
+  WORLD_HEIGHT,
+  worldWidthForCount,
+} from "@/lib/layout";
 
 type PhaseId = 1 | 2 | 3 | 4 | 5 | 6;
 
@@ -107,25 +131,20 @@ const SSPOISK_IDS: Record<string, string> = {
 };
 
 const STORAGE_KEY = "marvel-timeline-board-v1";
-const WORLD_WIDTH = 11000;
-const WORLD_HEIGHT = 2500;
-const TIMELINE_Y = 980;
 const MAX_VIEW_X = 0;
 const clampViewX = (x: number) => Math.min(MAX_VIEW_X, x);
 
-const getMovieX = (index: number) => 520 + index * 266;
-const getMovieY = (index: number) => (index % 2 === 0 ? 500 : 1110);
-
-function movieLink(movie: Movie) {
-  return `https://www.sspoisk.ru/film/${SSPOISK_IDS[movie.id]}/`;
+function movieLink(movie: { id: string }) {
+  const sid = SSPOISK_IDS[movie.id];
+  return sid ? `https://www.sspoisk.ru/film/${sid}/` : undefined;
 }
 
-function posterLink(movie: Movie) {
-  return `/posters/${movie.id}.jpg`;
+function posterLink(movie: { id: string }, override?: string) {
+  return override || `/posters/${movie.id}.jpg`;
 }
 
-async function getHighQualityPoster(movie: Movie) {
-  return posterLink(movie);
+async function getHighQualityPoster(movie: { id: string }, override?: string) {
+  return posterLink(movie, override);
 }
 
 async function imageBlobToPng(blob: Blob) {
@@ -138,7 +157,7 @@ async function imageBlobToPng(blob: Blob) {
   context.drawImage(bitmap, 0, 0);
   bitmap.close();
   return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((png) => png ? resolve(png) : reject(new Error("Не удалось преобразовать постер")), "image/png");
+    canvas.toBlob((png) => (png ? resolve(png) : reject(new Error("Не удалось преобразовать постер"))), "image/png");
   });
 }
 
@@ -151,23 +170,48 @@ function blobToDataUrl(blob: Blob) {
   });
 }
 
-function Poster({ movie }: { movie: Movie }) {
-  const [src, setSrc] = useState<string>(() => posterLink(movie));
+function characterBorderShadow(
+  characterIds: string[],
+  colorById: Map<string, { color: string; lineWidth: number }>,
+) {
+  const layers = characterIds
+    .map((id) => colorById.get(id))
+    .filter(Boolean)
+    .slice(0, 5);
+  if (!layers.length) return undefined;
+  return layers
+    .map((ch, i) => {
+      const spread = 3 + i * 3;
+      const alpha = Math.min(0.85, 0.35 + ch!.lineWidth * 0.04);
+      return `0 0 0 ${spread}px color-mix(in srgb, ${ch!.color} ${Math.round(alpha * 100)}%, transparent)`;
+    })
+    .join(", ");
+}
 
+function Poster({
+  title,
+  original,
+  src,
+}: {
+  title: string;
+  original: string;
+  src: string;
+}) {
+  const [current, setCurrent] = useState(src);
   useEffect(() => {
-    setSrc(posterLink(movie));
-  }, [movie]);
+    setCurrent(src);
+  }, [src]);
 
-  return src ? (
+  return current ? (
     <img
-      src={src}
-      alt={`Постер фильма «${movie.title}»`}
+      src={current}
+      alt={`Постер «${title}»`}
       draggable={false}
-      onError={() => setSrc("")}
+      onError={() => setCurrent("")}
     />
   ) : (
-    <span className="poster-fallback" aria-label={`Постер фильма «${movie.title}»`}>
-      <b>{movie.original.split(" ").slice(0, 2).map((word) => word[0]).join("")}</b>
+    <span className="poster-fallback" aria-label={`Постер «${title}»`}>
+      <b>{original.split(" ").slice(0, 2).map((word) => word[0]).join("")}</b>
       <small>MARVEL STUDIOS</small>
     </span>
   );
@@ -191,6 +235,12 @@ export default function Home() {
   const [toast, setToast] = useState("Карта готова к исследованию");
   const [copyingMovie, setCopyingMovie] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [mode, setMode] = useState<TimelineMode>("release");
+  const [overrides, setOverrides] = useState<EditorOverrides>(EMPTY_OVERRIDES);
+  const [editMode, setEditMode] = useState(false);
+  const [linesVisible, setLinesVisible] = useState(true);
+  const [selectedCharacterId, setSelectedCharacterId] = useState<string | null>(null);
+  const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
 
   useEffect(() => {
     try {
@@ -202,6 +252,7 @@ export default function Home() {
     } catch {
       localStorage.removeItem(STORAGE_KEY);
     }
+    setOverrides(loadEditorOverrides());
     setHydrated(true);
   }, []);
 
@@ -211,25 +262,82 @@ export default function Home() {
   }, [watched, hydrated]);
 
   useEffect(() => {
+    if (!hydrated) return;
+    saveEditorOverrides(overrides);
+  }, [overrides, hydrated]);
+
+  useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 2800);
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  const { items: allItems, characters } = useMemo(
+    () => buildBoardData(MOVIES, overrides),
+    [overrides],
+  );
+
+  const visibleItems = useMemo(
+    () => filterBoardItems(allItems, overrides.filters),
+    [allItems, overrides.filters],
+  );
+
+  const orderedItems = useMemo(() => sortItems(visibleItems, mode), [visibleItems, mode]);
+  const orderedIds = useMemo(() => orderedItems.map((i) => i.id), [orderedItems]);
+  const rects = useMemo(() => buildCardRects(orderedItems), [orderedItems]);
+  const worldWidth = worldWidthForCount(orderedItems.length);
+  const itemsById = useMemo(() => new Map(allItems.map((i) => [i.id, i])), [allItems]);
+
+  const colorById = useMemo(() => {
+    const map = new Map<string, { color: string; lineWidth: number }>();
+    for (const ch of characters) map.set(ch.id, { color: ch.color, lineWidth: ch.lineWidth });
+    return map;
+  }, [characters]);
+
   const matchingIds = useMemo(() => {
     const value = query.trim().toLocaleLowerCase("ru");
-    if (!value) return new Set(MOVIES.map((movie) => movie.id));
-    return new Set(MOVIES.filter((movie) => `${movie.title} ${movie.original} ${movie.year}`.toLocaleLowerCase("ru").includes(value)).map((movie) => movie.id));
-  }, [query]);
+    if (!value) return new Set(orderedItems.map((item) => item.id));
+
+    const characterMediaIds = new Set<string>();
+    for (const ch of characters) {
+      const hay = `${ch.name} ${ch.fullName ?? ""} ${(ch.aliases ?? []).join(" ")}`.toLocaleLowerCase("ru");
+      if (hay.includes(value)) {
+        for (const id of ch.appearances) characterMediaIds.add(id);
+      }
+    }
+
+    return new Set(
+      orderedItems
+        .filter(
+          (item) =>
+            characterMediaIds.has(item.id) ||
+            `${item.title} ${item.original} ${item.year} ${item.media.inUniverseStart}`
+              .toLocaleLowerCase("ru")
+              .includes(value),
+        )
+        .map((item) => item.id),
+    );
+  }, [query, orderedItems, characters]);
+
+  const selectedCharacter = selectedCharacterId
+    ? characters.find((c) => c.id === selectedCharacterId) ?? null
+    : null;
 
   const handleViewportPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     const target = event.target as HTMLElement;
-    if (target.closest(".watched-control, input, button")) return;
+    if (target.closest(".watched-control, input, button, .character-info-panel, .editor-panel, .map-controls, .character-legend, a")) return;
+    if (!(target as HTMLElement).closest(".movie-node")) {
+      setSelectedCharacterId(null);
+    }
     suppressPosterClickRef.current = false;
     dragRef.current = {
-      pointerId: event.pointerId, moved: false,
-      startX: event.clientX, startY: event.clientY, originX: view.x, originY: view.y,
+      pointerId: event.pointerId,
+      moved: false,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: view.x,
+      originY: view.y,
     };
   };
 
@@ -248,7 +356,9 @@ export default function Home() {
     setView((current) => ({ ...current, x: clampViewX(drag.originX + dx), y: drag.originY + dy }));
   };
 
-  const stopDrag = () => { dragRef.current = null; };
+  const stopDrag = () => {
+    dragRef.current = null;
+  };
 
   const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -262,10 +372,16 @@ export default function Home() {
   };
 
   const toggleWatched = (movieId: string) => {
-    setWatched((current) => current.includes(movieId) ? current.filter((id) => id !== movieId) : [...current, movieId]);
+    setWatched((current) =>
+      current.includes(movieId) ? current.filter((id) => id !== movieId) : [...current, movieId],
+    );
   };
 
-  const copyMovieAnnouncement = async (movie: Movie) => {
+  const copyMovieAnnouncement = async (movie: {
+    id: string;
+    title: string;
+    year: number;
+  }) => {
     const copiedAt = new Intl.DateTimeFormat("ru-RU", {
       hour: "2-digit",
       minute: "2-digit",
@@ -277,22 +393,29 @@ export default function Home() {
       if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
         throw new Error("Браузер не поддерживает копирование изображений");
       }
-      const posterUrl = await getHighQualityPoster(movie);
+      const posterUrl = await getHighQualityPoster(movie, overrides.posterOverrides[movie.id]);
       const posterResponse = await fetch(posterUrl);
       if (!posterResponse.ok) throw new Error("Не удалось загрузить постер");
       const png = await imageBlobToPng(await posterResponse.blob());
       const posterDataUrl = await blobToDataUrl(png);
-      const html = `<div><p>${text.split("\n").map((line) => line.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")).join("<br>")}</p><img src="${posterDataUrl}" alt="Постер фильма ${movie.title}" style="max-width:720px;height:auto"></div>`;
-      await navigator.clipboard.write([new ClipboardItem({
-        "text/plain": new Blob([text], { type: "text/plain" }),
-        "text/html": new Blob([html], { type: "text/html" }),
-        "image/png": png,
-      })]);
+      const html = `<div><p>${text
+        .split("\n")
+        .map((line) => line.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"))
+        .join("<br>")}</p><img src="${posterDataUrl}" alt="Постер фильма ${movie.title}" style="max-width:720px;height:auto"></div>`;
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/plain": new Blob([text], { type: "text/plain" }),
+          "text/html": new Blob([html], { type: "text/html" }),
+          "image/png": png,
+        }),
+      ]);
       setToast(`Текст и постер «${movie.title}» скопированы`);
     } catch (error) {
       try {
         await navigator.clipboard.writeText(text);
-        setToast(`Текст скопирован, но постер недоступен: ${error instanceof Error ? error.message : "ошибка браузера"}`);
+        setToast(
+          `Текст скопирован, но постер недоступен: ${error instanceof Error ? error.message : "ошибка браузера"}`,
+        );
       } catch {
         setToast("Не удалось открыть буфер обмена. Разрешите сайту копирование в настройках браузера.");
       }
@@ -302,17 +425,29 @@ export default function Home() {
   };
 
   const focusPhase = (phase: PhaseId) => {
-    const firstIndex = MOVIES.findIndex((movie) => movie.phase === phase);
+    const firstIndex = orderedItems.findIndex((item) => item.phase === phase);
+    if (firstIndex < 0) {
+      setToast("В текущих фильтрах нет проектов этой фазы");
+      return;
+    }
     const rect = viewportRef.current?.getBoundingClientRect();
-    setView((current) => ({ ...current, x: clampViewX((rect?.width ?? 900) * 0.22 - getMovieX(firstIndex) * current.scale), y: -250 }));
+    setView((current) => ({
+      ...current,
+      x: clampViewX((rect?.width ?? 900) * 0.22 - getItemX(firstIndex) * current.scale),
+      y: -250,
+    }));
   };
 
   const focusSearch = () => {
-    const movie = MOVIES.find((entry) => matchingIds.has(entry.id));
-    if (!movie || !query.trim()) return;
-    const index = MOVIES.indexOf(movie);
+    const item = orderedItems.find((entry) => matchingIds.has(entry.id));
+    if (!item || !query.trim()) return;
+    const index = orderedItems.indexOf(item);
     const rect = viewportRef.current?.getBoundingClientRect();
-    setView((current) => ({ ...current, x: clampViewX((rect?.width ?? 900) / 2 - getMovieX(index) * current.scale), y: (rect?.height ?? 700) / 2 - getMovieY(index) * current.scale }));
+    setView((current) => ({
+      ...current,
+      x: clampViewX((rect?.width ?? 900) / 2 - getItemX(index) * current.scale),
+      y: (rect?.height ?? 700) / 2 - getItemY(index) * current.scale,
+    }));
   };
 
   const resetBoard = () => {
@@ -320,9 +455,13 @@ export default function Home() {
       const accepted = window.confirm("Удалить все отметки о просмотре с этой карты?");
       if (!accepted) return;
     }
-    setWatched([]); setView({ x: 0, y: -250, scale: 0.72 });
+    setWatched([]);
+    setView({ x: 0, y: -250, scale: 0.72 });
+    setSelectedCharacterId(null);
     setToast("Карта возвращена к началу");
   };
+
+  const watchedCount = watched.filter((id) => orderedItems.some((i) => i.id === id)).length;
 
   return (
     <main className="app-shell">
@@ -335,7 +474,9 @@ export default function Home() {
           <span className="brand-divider" />
           <div>
             <h1>Timeline Board</h1>
-            <p>{watched.length} из {MOVIES.length} просмотрено · 6 фаз</p>
+            <p>
+              {watchedCount} из {orderedItems.length} на карте · {characters.length} персонажей
+            </p>
           </div>
         </div>
 
@@ -348,22 +489,52 @@ export default function Home() {
             placeholder="Найти героя, фильм или год"
             aria-label="Поиск по фильмам"
           />
-          {query && <button onClick={() => setQuery("")} aria-label="Очистить поиск">×</button>}
+          {query && (
+            <button onClick={() => setQuery("")} aria-label="Очистить поиск">
+              ×
+            </button>
+          )}
         </div>
 
         <div className="top-actions">
-          <button className="round-button" onClick={() => setHelpOpen(true)} aria-label="Как пользоваться">?</button>
-          <button className="reset-button" onClick={resetBoard}>Сбросить карту</button>
+          <button className="round-button" onClick={() => setHelpOpen(true)} aria-label="Как пользоваться">
+            ?
+          </button>
+          <button className="reset-button" onClick={resetBoard}>
+            Сбросить карту
+          </button>
         </div>
       </header>
 
       <nav className="phasebar" aria-label="Фазы киновселенной Marvel">
         {PHASES.map((phase) => (
-          <button key={phase.id} onClick={() => focusPhase(phase.id)} style={{ "--phase": phase.color } as React.CSSProperties}>
+          <button
+            key={phase.id}
+            onClick={() => focusPhase(phase.id)}
+            style={{ "--phase": phase.color } as React.CSSProperties}
+          >
             <i /> <span>{phase.label}</span> <small>{phase.years}</small>
           </button>
         ))}
       </nav>
+
+      <MapControls
+        mode={mode}
+        onModeChange={setMode}
+        filters={overrides.filters}
+        onFiltersChange={(filters) => setOverrides((o) => ({ ...o, filters }))}
+        editMode={editMode}
+        onEditModeChange={setEditMode}
+        linesVisible={linesVisible}
+        onLinesVisibleChange={setLinesVisible}
+      />
+
+      <CharacterLegend
+        characters={characters}
+        selectedId={selectedCharacterId}
+        hiddenIds={overrides.hiddenCharacterLines}
+        onSelect={setSelectedCharacterId}
+      />
 
       <div
         ref={viewportRef}
@@ -375,125 +546,282 @@ export default function Home() {
         onDragStart={(event) => event.preventDefault()}
         onWheel={handleWheel}
       >
-        <div className="world-grid" style={{ width: WORLD_WIDTH, height: WORLD_HEIGHT, transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}>
+        <div
+          className="world-grid"
+          style={{
+            width: worldWidth,
+            height: WORLD_HEIGHT,
+            transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})`,
+          }}
+        >
           <div className="world-heading">
             <span>АРХИВ · ЗЕМЛЯ—616</span>
-            <h2>Сага разворачивается<br />слева направо.</h2>
-            <p>Перетаскивайте пространство. Нажмите на постер, чтобы открыть фильм на SSpoisk.</p>
+            <h2>
+              Сага разворачивается
+              <br />
+              слева направо.
+            </h2>
+            <p>
+              Перетаскивайте пространство. Клик по линии персонажа подсвечивает его путь. Режим:{" "}
+              {mode === "release" ? "даты выхода" : "внутримировая хронология"}.
+            </p>
           </div>
 
-          <div className="timeline-line" style={{ top: TIMELINE_Y }} />
+          <div className="timeline-line" style={{ top: TIMELINE_Y, width: worldWidth - 700 }} />
 
-          {PHASES.map((phase) => {
-            const indices = MOVIES.map((movie, index) => ({ movie, index })).filter(({ movie }) => movie.phase === phase.id);
-            const first = indices[0]?.index ?? 0;
-            const last = indices.at(-1)?.index ?? first;
-            const left = getMovieX(first) - 78;
-            const width = getMovieX(last) - getMovieX(first) + 254;
-            return (
-              <div key={phase.id} className="phase-range" style={{ left, top: TIMELINE_Y - 44, width, "--phase": phase.color } as React.CSSProperties}>
-                <div className="phase-range-label"><b>{phase.label}</b><span>{phase.years}</span></div>
-              </div>
-            );
-          })}
+          {mode === "release" &&
+            PHASES.map((phase) => {
+              const indices = orderedItems
+                .map((item, index) => ({ item, index }))
+                .filter(({ item }) => item.phase === phase.id);
+              if (!indices.length) return null;
+              const first = indices[0].index;
+              const last = indices.at(-1)!.index;
+              const left = getItemX(first) - 78;
+              const width = getItemX(last) - getItemX(first) + 254;
+              return (
+                <div
+                  key={phase.id}
+                  className="phase-range"
+                  style={
+                    {
+                      left,
+                      top: TIMELINE_Y - 44,
+                      width,
+                      "--phase": phase.color,
+                    } as React.CSSProperties
+                  }
+                >
+                  <div className="phase-range-label">
+                    <b>{phase.label}</b>
+                    <span>{phase.years}</span>
+                  </div>
+                </div>
+              );
+            })}
 
-          {MOVIES.map((movie, index) => {
-            const x = getMovieX(index);
-            const y = getMovieY(index);
+          {linesVisible && (
+            <CharacterLines
+              characters={characters}
+              orderedIds={orderedIds}
+              rects={rects}
+              hiddenIds={overrides.hiddenCharacterLines}
+              selectedId={selectedCharacterId}
+              onSelect={setSelectedCharacterId}
+            />
+          )}
+
+          {orderedItems.map((item, index) => {
+            const x = getItemX(index);
+            const y = getItemY(index);
             const above = y < TIMELINE_Y;
-            const phase = PHASES.find((entry) => entry.id === movie.phase)!;
-            const matched = matchingIds.has(movie.id);
-            const isWatched = watched.includes(movie.id);
+            const phase = item.phase ? PHASES.find((entry) => entry.id === item.phase) : null;
+            const matched = matchingIds.has(item.id);
+            const isWatched = watched.includes(item.id);
+            const link = movieLink(item);
+            const inSelected =
+              !selectedCharacterId ||
+              selectedCharacter?.appearances.includes(item.id) ||
+              selectedCharacter?.mentions?.includes(item.id);
+            const mainChars = item.media.characters
+              .filter((a) => a.role === "main" || a.role === "supporting")
+              .map((a) => a.characterId);
+            const borderShadow = characterBorderShadow(mainChars, colorById);
+            const caption = formatCardCaption(item, mode, phase?.label);
+            const dimmedByCharacter = selectedCharacterId && !inSelected;
+            const posterSrc = posterLink(item, overrides.posterOverrides[item.id]);
+            const announced = item.media.canonStatus === "announced";
+
             return (
-              <article
-                key={movie.id}
-                className={`movie-node ${above ? "above" : "below"} ${matched ? "matched" : "muted"} ${isWatched ? "watched" : ""}`}
-                style={{ left: x, top: y, "--phase": phase.color } as React.CSSProperties}
+              <motion.article
+                key={item.id}
+                className={`movie-node ${above ? "above" : "below"} ${matched && !dimmedByCharacter ? "matched" : "muted"} ${isWatched ? "watched" : ""} ${announced ? "announced" : ""} ${selectedMediaId === item.id ? "editor-selected" : ""}`}
+                initial={false}
+                animate={{ left: x, top: y }}
+                transition={{ type: "spring", stiffness: 120, damping: 20 }}
+                style={
+                  {
+                    "--phase": phase?.color ?? "#8d96a8",
+                    boxShadow: borderShadow,
+                  } as React.CSSProperties
+                }
+                onClick={() => {
+                  if (editMode) setSelectedMediaId(item.id);
+                }}
               >
                 <span className="connector" />
-                <span className="timeline-dot"><i /></span>
+                <span className="timeline-dot">
+                  <i />
+                </span>
                 <div className="movie-order">{String(index + 1).padStart(2, "0")}</div>
                 <div className="poster-shell">
-                  <a
-                    className="poster-link"
-                    href={movieLink(movie)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    draggable={false}
-                    onClick={(event) => {
-                      if (!suppressPosterClickRef.current) return;
-                      event.preventDefault();
-                      event.stopPropagation();
-                      suppressPosterClickRef.current = false;
-                    }}
-                    aria-label={`Открыть страницу фильма «${movie.title}» на SSpoisk`}
-                  >
-                    <Poster movie={movie} />
-                    <span className="play-orbit"><b>▶</b></span>
-                  </a>
+                  {link ? (
+                    <a
+                      className="poster-link"
+                      href={link}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      draggable={false}
+                      onClick={(event) => {
+                        if (!suppressPosterClickRef.current) return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        suppressPosterClickRef.current = false;
+                      }}
+                      aria-label={`Открыть страницу «${item.title}» на SSpoisk`}
+                    >
+                      <Poster title={item.title} original={item.original} src={posterSrc} />
+                      <span className="play-orbit">
+                        <b>▶</b>
+                      </span>
+                    </a>
+                  ) : (
+                    <div className="poster-link poster-link-static" aria-label={`Постер «${item.title}»`}>
+                      <Poster title={item.title} original={item.original} src={posterSrc} />
+                    </div>
+                  )}
                   <label
                     className="watched-control"
                     title={isWatched ? "Отмечено как просмотренное" : "Отметить как просмотренное"}
                     onPointerDown={(event) => event.stopPropagation()}
                   >
-                    <input type="checkbox" checked={isWatched} onChange={() => toggleWatched(movie.id)} />
+                    <input
+                      type="checkbox"
+                      checked={isWatched}
+                      onChange={() => toggleWatched(item.id)}
+                    />
                     <i aria-hidden="true">✓</i>
                     <span>{isWatched ? "Просмотрено" : "Отметить просмотренным"}</span>
                   </label>
                 </div>
                 <div className="movie-copy">
-                  <span>{movie.year} · {phase.label}</span>
-                  <h3>{movie.title}</h3>
-                  <p>{movie.original}</p>
-                  <button
-                    className="copy-watch-button"
-                    type="button"
-                    disabled={copyingMovie === movie.id}
-                    onClick={() => copyMovieAnnouncement(movie)}
-                    aria-label={`Скопировать текст и постер фильма «${movie.title}»`}
-                    title={copyingMovie === movie.id ? "Готовим постер…" : "Скопировать текст и постер"}
-                  >
-                    <span className="copy-glyph" aria-hidden="true">
-                      <svg viewBox="0 0 24 24" fill="none">
-                        <rect x="8" y="8" width="11" height="11" rx="2" />
-                        <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
-                      </svg>
-                    </span>
-                  </button>
+                  <span>{caption}</span>
+                  <h3>{item.title}</h3>
+                  <p>{item.original}</p>
+                  {link && (
+                    <button
+                      className="copy-watch-button"
+                      type="button"
+                      disabled={copyingMovie === item.id}
+                      onClick={() =>
+                        copyMovieAnnouncement({
+                          id: item.id,
+                          title: item.title,
+                          year: item.year,
+                        })
+                      }
+                      aria-label={`Скопировать текст и постер «${item.title}»`}
+                      title={copyingMovie === item.id ? "Готовим постер…" : "Скопировать текст и постер"}
+                    >
+                      <span className="copy-glyph" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none">
+                          <rect x="8" y="8" width="11" height="11" rx="2" />
+                          <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+                        </svg>
+                      </span>
+                    </button>
+                  )}
                 </div>
-              </article>
+              </motion.article>
             );
           })}
-
         </div>
       </div>
 
+      {selectedCharacter && (
+        <CharacterInfoPanel
+          character={selectedCharacter}
+          itemsById={itemsById}
+          onClose={() => setSelectedCharacterId(null)}
+        />
+      )}
+
+      <EditorPanel
+        open={editMode}
+        overrides={overrides}
+        onChange={setOverrides}
+        characters={characters}
+        items={allItems}
+        selectedMediaId={selectedMediaId}
+        onToast={setToast}
+      />
+
       <div className="zoom-control">
-        <button onClick={() => setView((current) => ({ ...current, scale: Math.max(0.28, current.scale - 0.1) }))} aria-label="Уменьшить">−</button>
+        <button
+          onClick={() =>
+            setView((current) => ({ ...current, scale: Math.max(0.28, current.scale - 0.1) }))
+          }
+          aria-label="Уменьшить"
+        >
+          −
+        </button>
         <span>{Math.round(view.scale * 100)}%</span>
-        <button onClick={() => setView((current) => ({ ...current, scale: Math.min(1.45, current.scale + 0.1) }))} aria-label="Увеличить">+</button>
+        <button
+          onClick={() =>
+            setView((current) => ({ ...current, scale: Math.min(1.45, current.scale + 0.1) }))
+          }
+          aria-label="Увеличить"
+        >
+          +
+        </button>
       </div>
 
       <div className="board-status">
         <span className="live-dot" />
         <span>{hydrated ? "Сохраняется на этом устройстве" : "Загрузка карты…"}</span>
-        <kbd>колесо</kbd><span>масштаб под курсором</span>
+        <kbd>колесо</kbd>
+        <span>масштаб под курсором</span>
       </div>
 
-      {toast && <div className="toast" role="status">{toast}</div>}
+      {toast && (
+        <div className="toast" role="status">
+          {toast}
+        </div>
+      )}
 
       {helpOpen && (
         <div className="modal-backdrop" onPointerDown={() => setHelpOpen(false)}>
-          <section className="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title" onPointerDown={(event) => event.stopPropagation()}>
-            <button className="modal-close" onClick={() => setHelpOpen(false)} aria-label="Закрыть">×</button>
+          <section
+            className="help-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="help-title"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <button className="modal-close" onClick={() => setHelpOpen(false)} aria-label="Закрыть">
+              ×
+            </button>
             <span className="modal-kicker">КАК ЭТО РАБОТАЕТ</span>
             <h2 id="help-title">Ваша карта киновселенной</h2>
             <div className="help-grid">
-              <div><b>01</b><h3>Исследуйте</h3><p>Тяните пустое пространство, а колесом масштабируйте карту относительно курсора. Фазы идут слева направо.</p></div>
-              <div><b>02</b><h3>Готовьте эфир</h3><p>Кнопка «Копировать» забирает текст с текущим временем, Twitch-ссылку и постер фильма в хорошем качестве.</p></div>
-              <div><b>03</b><h3>Открывайте</h3><p>Нажмите на постер — страница фильма на SSpoisk откроется в новой вкладке.</p></div>
+              <div>
+                <b>01</b>
+                <h3>Исследуйте</h3>
+                <p>
+                  Тяните пустое пространство, колесом масштабируйте. Переключайте «даты выхода» и
+                  «хронологию». Клик по цветной линии — путь персонажа.
+                </p>
+              </div>
+              <div>
+                <b>02</b>
+                <h3>Готовьте эфир</h3>
+                <p>
+                  Кнопка «Копировать» забирает текст с текущим временем, Twitch-ссылку и постер
+                  фильма в хорошем качестве.
+                </p>
+              </div>
+              <div>
+                <b>03</b>
+                <h3>Редактируйте</h3>
+                <p>
+                  В редакторе можно заменить постеры, цвета линий и участие персонажей. Данные
+                  хранятся отдельно от отметок «Просмотрено».
+                </p>
+              </div>
             </div>
-            <button className="primary-button" onClick={() => setHelpOpen(false)}>Начать путешествие</button>
+            <button className="primary-button" onClick={() => setHelpOpen(false)}>
+              Начать путешествие
+            </button>
           </section>
         </div>
       )}
