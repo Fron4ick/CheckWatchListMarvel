@@ -119,13 +119,13 @@ export function buildBoardData(
         ? movie
         : m.phase
           ? {
-              id: m.id,
-              title: m.title,
-              original: m.originalTitle ?? m.title,
-              year: yearFromIso(m.releaseDate),
-              phase: m.phase,
-              wiki: "",
-            }
+            id: m.id,
+            title: m.title,
+            original: m.originalTitle ?? m.title,
+            year: yearFromIso(m.releaseDate),
+            phase: m.phase,
+            wiki: "",
+          }
           : null,
     };
   });

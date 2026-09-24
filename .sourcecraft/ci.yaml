@@ -1,0 +1,162 @@
+# CI/CD: deployment of the backend (Yandex Cloud Functions) and the frontend
+# (Yandex Cloud Object Storage) to Yandex Cloud.
+# Docs: https://sourcecraft.dev/portal/docs/en/sourcecraft/tutorials/ci-cd-sourcecraft-functions
+
+on:
+  push:
+    - workflows: [deploy-backend]
+      filter:
+        branches: ["master", "main"]
+        paths: ["backend/**"]
+    - workflows: [deploy-frontend]
+      filter:
+        branches: ["master", "main"]
+        paths: ["**"]
+
+tokens:
+  yc-deploy:
+    # Name of the service connection created in SourceCraft
+    # (must match the actual connection name, e.g. default-service-connection).
+    service_connection: default-service-connection
+    # Requested access scope:
+    # org: All repositories
+    # repo: Specific repository
+    # ref: Branch or tag
+    scope: repo
+
+workflows:
+  deploy-backend:
+    tasks:
+      - name: deploy-cloud-function
+        env:
+          SOURCE_PATH: "./backend"
+          YC_FUNCTION_NAME: "marvel-timeline-backend"
+          YC_FUNCTION_RUNTIME: "nodejs22"
+          YC_FUNCTION_ENTRYPOINT: "index.handler"
+          YDB_DOCAPI_ENDPOINT: "https://docapi.serverless.yandexcloud.net/ru-central1/b1gp8ldqrevcvu23e82l/etneo5gfc9hj4v2p3rga"
+          YDB_TABLE_PREFIX: "marvel_"
+        cubes:
+          # Obtain a short-lived IAM token for the service account from the
+          # service connection (Workload Identity/OIDC federation).
+          - name: get-iam-token
+            env:
+              ID_TOKEN: ${{ tokens.yc-deploy.id_token }}
+              YC_SA_ID: ${{ tokens.yc-deploy.service_account_id }}
+            image: cr.yandex/sourcecraft/yc-iam:latest
+
+          # Create the function if it does not exist yet (no-op when present).
+          - name: check-and-create-function
+            env:
+              YC_IAM_TOKEN: ${{ cubes.get-iam-token.outputs.IAM_TOKEN }}
+              YC_FOLDER_ID: ${{ tokens.yc-deploy.folder_id }}
+            image:
+              name: cr.yandex/sourcecraft/yc-cli:latest
+              entrypoint: ""
+            script:
+              - |
+                yc config set folder-id $YC_FOLDER_ID
+                echo "Checking if function exists..."
+                if ! yc serverless function get --name=$YC_FUNCTION_NAME; then
+                  echo "Function does not exist. Creating new function..."
+                  yc serverless function create --name=$YC_FUNCTION_NAME
+                else
+                  echo "Function already exists. Proceeding to version deployment..."
+                fi
+
+          # Publish a new version of the function. The service account is
+          # attached explicitly so the function can call YDB via the metadata
+          # service (YDB_IAM_TOKEN is not required inside Cloud Functions).
+          - name: deploy-function-version
+            env:
+              YC_IAM_TOKEN: ${{ cubes.get-iam-token.outputs.IAM_TOKEN }}
+              YC_FOLDER_ID: ${{ tokens.yc-deploy.folder_id }}
+              YC_SA_ID: ${{ tokens.yc-deploy.service_account_id }}
+            image:
+              name: cr.yandex/sourcecraft/yc-cli:latest
+              entrypoint: ""
+            script:
+              - |
+                mkdir -p ./tmp
+                cp "$SOURCE_PATH"/index.js "$SOURCE_PATH"/package.json ./tmp
+                cp -r "$SOURCE_PATH"/src ./tmp
+                echo "Deploying new function version..."
+                yc config set folder-id $YC_FOLDER_ID
+                yc serverless function version create \
+                  --function-name=$YC_FUNCTION_NAME \
+                  --runtime $YC_FUNCTION_RUNTIME \
+                  --entrypoint $YC_FUNCTION_ENTRYPOINT \
+                  --service-account-id $YC_SA_ID \
+                  --execution-timeout 30s \
+                  --memory 256MB \
+                  --environment YDB_DOCAPI_ENDPOINT=$YDB_DOCAPI_ENDPOINT,YDB_TABLE_PREFIX=$YDB_TABLE_PREFIX \
+                  --source-path ./tmp
+                echo "Making function publicly invokable..."
+                yc serverless function allow-unauthenticated-invoke $YC_FUNCTION_NAME
+
+  deploy-frontend:
+    tasks:
+      - name: build-and-upload
+        env:
+          YC_BUCKET_NAME: "marvel-timeline-board"
+        cubes:
+          # Static export of the Next.js app into ./out.
+          - name: build
+            image:
+              name: node:22
+              entrypoint: ""
+            script:
+              - |
+                set -e
+                npm ci
+                npm run build
+                test -f out/index.html
+
+          # Obtain a short-lived IAM token (same service connection as backend).
+          - name: get-iam-token
+            env:
+              ID_TOKEN: ${{ tokens.yc-deploy.id_token }}
+              YC_SA_ID: ${{ tokens.yc-deploy.service_account_id }}
+            image: cr.yandex/sourcecraft/yc-iam:latest
+
+          # Configure bucket website hosting and upload the static site.
+          - name: upload-static
+            env:
+              YC_IAM_TOKEN: ${{ cubes.get-iam-token.outputs.IAM_TOKEN }}
+              YC_FOLDER_ID: ${{ tokens.yc-deploy.folder_id }}
+              YC_BUCKET_NAME: "marvel-timeline-board"
+            image:
+              name: cr.yandex/sourcecraft/yc-cli:latest
+              entrypoint: ""
+            script:
+              - |
+                set -euo pipefail
+                yc config set folder-id "$YC_FOLDER_ID"
+                echo "Configuring bucket website hosting..."
+                yc storage s3api put-bucket-website --bucket "$YC_BUCKET_NAME" \
+                  --website-configuration '{"IndexDocument":{"Suffix":"index.html"},"ErrorDocument":{"Key":"index.html"}}' || true
+                yc storage s3api put-bucket-acl --bucket "$YC_BUCKET_NAME" --acl public-read || true
+                echo "Uploading static site to $YC_BUCKET_NAME..."
+                cd out
+                count=0
+                find . -type f -print0 | while IFS= read -r -d '' f; do
+                  key="${f#./}"
+                  mime="application/octet-stream"
+                  case "$key" in
+                    *.html) mime="text/html" ;;
+                    *.js)    mime="application/javascript" ;;
+                    *.css)   mime="text/css" ;;
+                    *.svg)   mime="image/svg+xml" ;;
+                    *.png)   mime="image/png" ;;
+                    *.jpg|*.jpeg) mime="image/jpeg" ;;
+                    *.webp)  mime="image/webp" ;;
+                    *.json)  mime="application/json" ;;
+                  esac
+                  cc="no-cache"
+                  case "$key" in
+                    _next/*|posters/*|favicon.svg|og.png|*.svg) cc="public, max-age=31536000, immutable" ;;
+                  esac
+                  yc storage s3api put-object --bucket "$YC_BUCKET_NAME" --key "$key" \
+                    --body "$f" --content-type "$mime" --cache-control "$cc"
+                  count=$((count + 1))
+                done
+                echo "Uploaded $count files."

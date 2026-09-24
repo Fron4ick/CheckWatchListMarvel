@@ -7,9 +7,11 @@
   },
   "scripts": {
     "dev": "next dev",
+    "dev:clean": "node scripts/dev-clean.mjs",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint . --ignore-pattern .next"
+    "lint": "eslint . --ignore-pattern .next",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "framer-motion": "^13.3.0",

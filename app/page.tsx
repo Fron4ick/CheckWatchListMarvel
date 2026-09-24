@@ -1,13 +1,28 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CharacterLines } from "@/components/CharacterLines";
 import { CharacterInfoPanel } from "@/components/CharacterInfoPanel";
 import { CharacterLegend } from "@/components/CharacterLegend";
 import { EditorPanel } from "@/components/EditorPanel";
 import { MapControls } from "@/components/MapControls";
+import { MovieCard } from "@/components/MovieCard";
+import { AuthModal } from "@/components/AuthModal";
+import type { GlowLayer } from "@/components/CardGlow";
 import type { EditorOverrides, TimelineMode } from "@/data/types";
+import { api, apiEnabled, type ApiUser, type WatchedMap } from "@/lib/api";
+import {
+  loadSession,
+  loadSyncTimes,
+  mergeWatchlists,
+  nowIso,
+  saveSession,
+  saveSyncTimes,
+  timesFromItems,
+  toWatchedItems,
+  watchedIdsFromItems,
+  type StoredSession,
+} from "@/lib/watchlist";
 import {
   buildBoardData,
   EMPTY_OVERRIDES,
@@ -18,6 +33,7 @@ import {
 import {
   buildCardRects,
   formatCardCaption,
+  CARD_WIDTH,
   getItemX,
   getItemY,
   sortItems,
@@ -139,11 +155,14 @@ function movieLink(movie: { id: string }) {
   return sid ? `https://www.sspoisk.ru/film/${sid}/` : undefined;
 }
 
-function posterLink(movie: { id: string }, override?: string) {
-  return override || `/posters/${movie.id}.jpg`;
+function posterLink(movie: { id: string; posterPath?: string }, override?: string) {
+  return override || movie.posterPath || `/posters/${movie.id}.jpg`;
 }
 
-async function getHighQualityPoster(movie: { id: string }, override?: string) {
+async function getHighQualityPoster(
+  movie: { id: string; posterPath?: string },
+  override?: string,
+) {
   return posterLink(movie, override);
 }
 
@@ -170,51 +189,15 @@ function blobToDataUrl(blob: Blob) {
   });
 }
 
-function characterBorderShadow(
+function characterGlowLayers(
   characterIds: string[],
   colorById: Map<string, { color: string; lineWidth: number }>,
-) {
-  const layers = characterIds
+): GlowLayer[] {
+  return characterIds
     .map((id) => colorById.get(id))
-    .filter(Boolean)
-    .slice(0, 5);
-  if (!layers.length) return undefined;
-  return layers
-    .map((ch, i) => {
-      const spread = 3 + i * 3;
-      const alpha = Math.min(0.85, 0.35 + ch!.lineWidth * 0.04);
-      return `0 0 0 ${spread}px color-mix(in srgb, ${ch!.color} ${Math.round(alpha * 100)}%, transparent)`;
-    })
-    .join(", ");
-}
-
-function Poster({
-  title,
-  original,
-  src,
-}: {
-  title: string;
-  original: string;
-  src: string;
-}) {
-  const [current, setCurrent] = useState(src);
-  useEffect(() => {
-    setCurrent(src);
-  }, [src]);
-
-  return current ? (
-    <img
-      src={current}
-      alt={`Постер «${title}»`}
-      draggable={false}
-      onError={() => setCurrent("")}
-    />
-  ) : (
-    <span className="poster-fallback" aria-label={`Постер «${title}»`}>
-      <b>{original.split(" ").slice(0, 2).map((word) => word[0]).join("")}</b>
-      <small>MARVEL STUDIOS</small>
-    </span>
-  );
+    .filter((ch): ch is { color: string; lineWidth: number } => Boolean(ch))
+    .slice(0, 5)
+    .map((ch) => ({ color: ch.color, width: Math.max(2, ch.lineWidth * 0.9) }));
 }
 
 export default function Home() {
@@ -242,29 +225,151 @@ export default function Home() {
   const [selectedCharacterId, setSelectedCharacterId] = useState<string | null>(null);
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
 
+  // ── Облачная синхронизация (backend) ────────────────────────────────────
+  const [session, setSession] = useState<StoredSession | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [times, setTimes] = useState<Record<string, string>>({});
+  const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "error">("idle");
+  const pushTimerRef = useRef<number | null>(null);
+
+  /* eslint-disable react-hooks/set-state-in-effect */
+  // Гидрация из localStorage — синхронные setState в эффекте здесь неизбежны:
+  // на сервере window недоступен, поэтому инициализация состояния возможна
+  // только после монтирования (стандартный паттерн Next.js "use client").
   useEffect(() => {
+    let legacyIds: string[] = [];
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const data = JSON.parse(saved);
-        setWatched(Array.isArray(data.watched) ? data.watched : []);
+        legacyIds = Array.isArray(data.watched) ? data.watched : [];
       }
     } catch {
       localStorage.removeItem(STORAGE_KEY);
     }
+    setWatched(legacyIds);
+    setTimes(loadSyncTimes(legacyIds));
     setOverrides(loadEditorOverrides());
+    setSession(loadSession());
     setHydrated(true);
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
     if (!hydrated) return;
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ watched }));
-  }, [watched, hydrated]);
+    saveSyncTimes(times);
+  }, [watched, times, hydrated]);
 
   useEffect(() => {
     if (!hydrated) return;
     saveEditorOverrides(overrides);
   }, [overrides, hydrated]);
+
+  // ── Синхронизация «Просмотрено» с backend (LWW по updatedAt) ────────────
+
+  const applyRemoteSession = useCallback(
+    (token: string, user: ApiUser, serverItems: WatchedMap) => {
+      const localItems = toWatchedItems(watched, times);
+      const merged = mergeWatchlists(serverItems, localItems);
+      const nextIds = watchedIdsFromItems(merged);
+      const nextTimes = timesFromItems(merged);
+      setWatched(nextIds);
+      setTimes(nextTimes);
+      saveSyncTimes(nextTimes);
+      setSession({ token, user });
+      saveSession({ token, user });
+      setSyncStatus("idle");
+    },
+    [watched, times],
+  );
+
+  // OAuth: переход на FRONTEND_URL/?auth=<token> — сохраняем сессию и мержим данные.
+  useEffect(() => {
+    if (!hydrated) return;
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("auth");
+    if (!token) return;
+    window.history.replaceState({}, "", window.location.pathname);
+    api
+      .me(token)
+      .then((result) => applyRemoteSession(token, result.user, result.watched.items))
+      .catch(() => {
+        saveSession(null);
+        setToast("Не удалось завершить вход через внешний сервис");
+      });
+  }, [hydrated, applyRemoteSession]);
+
+  // Восстановление сессии: подтягиваем серверный список и объединяем с локальным.
+  useEffect(() => {
+    if (!hydrated || !session) return;
+    let cancelled = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSyncStatus("syncing");
+    api
+      .me(session.token)
+      .then(async (result) => {
+        if (cancelled) return;
+        const localItems = toWatchedItems(watched, times);
+        const merged = mergeWatchlists(result.watched.items, localItems);
+        const nextIds = watchedIdsFromItems(merged);
+        const nextTimes = timesFromItems(merged);
+        setWatched(nextIds);
+        setTimes(nextTimes);
+        saveSyncTimes(nextTimes);
+        if (!cancelled) setSyncStatus("idle");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Токен невалиден (401) — тихо разлогиниваемся.
+        saveSession(null);
+        setSession(null);
+        setSyncStatus("idle");
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, session?.token]);
+
+  // Отправка изменений на сервер с debounce.
+  useEffect(() => {
+    if (!hydrated || !session) return;
+    if (pushTimerRef.current !== null) window.clearTimeout(pushTimerRef.current);
+    pushTimerRef.current = window.setTimeout(() => {
+      setSyncStatus("syncing");
+      const items = toWatchedItems(watched, times);
+      api
+        .mergeWatched(session.token, items)
+        .then((result) => {
+          const merged = result.items ?? items;
+          const nextIds = watchedIdsFromItems(merged);
+          const nextTimes = timesFromItems(merged);
+          // Функциональные обновления с guard: если сервер вернул то же самое,
+          // возвращаем прежние ссылки — React не делает ре-рендер, и эффект
+          // не перезапускается (иначе получился бы бесконечный цикл push→merge→push).
+          setWatched((current) =>
+            current.length === nextIds.length &&
+            current.every((id, index) => id === nextIds[index])
+              ? current
+              : nextIds,
+          );
+          setTimes((current) => {
+            const keys = new Set([...Object.keys(current), ...Object.keys(nextTimes)]);
+            for (const key of keys) {
+              if (current[key] !== nextTimes[key]) return nextTimes;
+            }
+            return current;
+          });
+          saveSyncTimes(nextTimes);
+          setSyncStatus("idle");
+        })
+        .catch(() => setSyncStatus("error"));
+    }, 700);
+    return () => {
+      if (pushTimerRef.current !== null) window.clearTimeout(pushTimerRef.current);
+    };
+  }, [watched, times, session, hydrated]);
 
   useEffect(() => {
     if (!toast) return;
@@ -323,6 +428,35 @@ export default function Home() {
     ? characters.find((c) => c.id === selectedCharacterId) ?? null
     : null;
 
+  useEffect(() => {
+    if (!selectedCharacter) return;
+    const indices = orderedItems
+      .map((item, index) => ({ item, index }))
+      .filter(
+        ({ item }) =>
+          selectedCharacter.appearances.includes(item.id) ||
+          selectedCharacter.mentions?.includes(item.id),
+      );
+    if (!indices.length) return;
+    const first = indices[0].index;
+    const last = indices.at(-1)!.index;
+    const rect = viewportRef.current?.getBoundingClientRect();
+    const vw = rect?.width ?? 900;
+    const vh = rect?.height ?? 700;
+    const left = getItemX(first);
+    const right = getItemX(last) + CARD_WIDTH;
+    const span = Math.max(right - left, 1);
+    const scale = Math.min(1.1, Math.max(0.12, (vw * 0.72) / span));
+    const midX = (left + right) / 2;
+    const ys = indices.map(({ item, index }) => getItemY(item, index));
+    const midY = (Math.min(...ys) + Math.max(...ys)) / 2;
+    setView({
+      x: clampViewX(vw / 2 - midX * scale),
+      y: vh / 2 - midY * scale,
+      scale,
+    });
+  }, [selectedCharacter, orderedItems]);
+
   const handleViewportPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     const target = event.target as HTMLElement;
@@ -365,64 +499,97 @@ export default function Home() {
     const rect = event.currentTarget.getBoundingClientRect();
     const mouseX = event.clientX - rect.left;
     const mouseY = event.clientY - rect.top;
-    const nextScale = Math.min(1.45, Math.max(0.28, view.scale * Math.exp(-event.deltaY * 0.0018)));
+    const nextScale = Math.min(1.45, Math.max(0.12, view.scale * Math.exp(-event.deltaY * 0.0018)));
     const worldX = (mouseX - view.x) / view.scale;
     const worldY = (mouseY - view.y) / view.scale;
     setView({ x: clampViewX(mouseX - worldX * nextScale), y: mouseY - worldY * nextScale, scale: nextScale });
   };
 
-  const toggleWatched = (movieId: string) => {
+  const toggleWatched = useCallback((movieId: string) => {
+    const stamp = nowIso();
     setWatched((current) =>
       current.includes(movieId) ? current.filter((id) => id !== movieId) : [...current, movieId],
     );
-  };
+    setTimes((current) => ({ ...current, [movieId]: stamp }));
+  }, []);
 
-  const copyMovieAnnouncement = async (movie: {
-    id: string;
-    title: string;
-    year: number;
-  }) => {
-    const copiedAt = new Intl.DateTimeFormat("ru-RU", {
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(new Date());
-    const text = `Начали смотреть "${movie.title}" ${movie.year}г\n${copiedAt}\n\nhttps://www.twitch.tv/guacamolemolly`;
-    setCopyingMovie(movie.id);
-
-    try {
-      if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
-        throw new Error("Браузер не поддерживает копирование изображений");
-      }
-      const posterUrl = await getHighQualityPoster(movie, overrides.posterOverrides[movie.id]);
-      const posterResponse = await fetch(posterUrl);
-      if (!posterResponse.ok) throw new Error("Не удалось загрузить постер");
-      const png = await imageBlobToPng(await posterResponse.blob());
-      const posterDataUrl = await blobToDataUrl(png);
-      const html = `<div><p>${text
-        .split("\n")
-        .map((line) => line.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"))
-        .join("<br>")}</p><img src="${posterDataUrl}" alt="Постер фильма ${movie.title}" style="max-width:720px;height:auto"></div>`;
-      await navigator.clipboard.write([
-        new ClipboardItem({
-          "text/plain": new Blob([text], { type: "text/plain" }),
-          "text/html": new Blob([html], { type: "text/html" }),
-          "image/png": png,
-        }),
-      ]);
-      setToast(`Текст и постер «${movie.title}» скопированы`);
-    } catch (error) {
+  const handleLogout = useCallback(async () => {
+    if (session) {
       try {
-        await navigator.clipboard.writeText(text);
-        setToast(
-          `Текст скопирован, но постер недоступен: ${error instanceof Error ? error.message : "ошибка браузера"}`,
-        );
+        await api.logout(session.token);
       } catch {
-        setToast("Не удалось открыть буфер обмена. Разрешите сайту копирование в настройках браузера.");
+        // Токен может быть уже невалиден — продолжаем выход.
       }
-    } finally {
-      setCopyingMovie(null);
     }
-  };
+    saveSession(null);
+    setSession(null);
+    setSyncStatus("idle");
+    setToast("Вы вышли из облачной синхронизации");
+  }, [session]);
+
+  const copyMovieAnnouncement = useCallback(
+    async (movie: {
+      id: string;
+      title: string;
+      year: number;
+    }) => {
+      const item = itemsById.get(movie.id);
+      const movieWithPoster = item
+        ? { id: movie.id, posterPath: item.media.posterPath }
+        : { id: movie.id };
+      const copiedAt = new Intl.DateTimeFormat("ru-RU", {
+        hour: "2-digit",
+        minute: "2-digit",
+      }).format(new Date());
+      const text = `Начали смотреть "${movie.title}" ${movie.year}г\n${copiedAt}\n\nhttps://www.twitch.tv/guacamolemolly`;
+      setCopyingMovie(movie.id);
+
+      try {
+        if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+          throw new Error("Браузер не поддерживает копирование изображений");
+        }
+        const posterUrl = await getHighQualityPoster(
+          movieWithPoster,
+          overrides.posterOverrides[movie.id],
+        );
+        const posterResponse = await fetch(posterUrl);
+        if (!posterResponse.ok) throw new Error("Не удалось загрузить постер");
+        const png = await imageBlobToPng(await posterResponse.blob());
+        const posterDataUrl = await blobToDataUrl(png);
+        const html = `<div><p>${text
+          .split("\n")
+          .map((line) => line.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"))
+          .join("<br>")}</p><img src="${posterDataUrl}" alt="Постер фильма ${movie.title}" style="max-width:720px;height:auto"></div>`;
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            "text/plain": new Blob([text], { type: "text/plain" }),
+            "text/html": new Blob([html], { type: "text/html" }),
+            "image/png": png,
+          }),
+        ]);
+        setToast(`Текст и постер «${movie.title}» скопированы`);
+      } catch (error) {
+        try {
+          await navigator.clipboard.writeText(text);
+          setToast(
+            `Текст скопирован, но постер недоступен: ${error instanceof Error ? error.message : "ошибка браузера"}`,
+          );
+        } catch {
+          setToast("Не удалось открыть буфер обмена. Разрешите сайту копирование в настройках браузера.");
+        }
+      } finally {
+        setCopyingMovie(null);
+      }
+    },
+    [overrides.posterOverrides, itemsById],
+  );
+
+  const handleSelectMedia = useCallback(
+    (id: string) => {
+      if (editMode) setSelectedMediaId(id);
+    },
+    [editMode],
+  );
 
   const focusPhase = (phase: PhaseId) => {
     const firstIndex = orderedItems.findIndex((item) => item.phase === phase);
@@ -446,7 +613,7 @@ export default function Home() {
     setView((current) => ({
       ...current,
       x: clampViewX((rect?.width ?? 900) / 2 - getItemX(index) * current.scale),
-      y: (rect?.height ?? 700) / 2 - getItemY(index) * current.scale,
+      y: (rect?.height ?? 700) / 2 - getItemY(item, index) * current.scale,
     }));
   };
 
@@ -503,6 +670,43 @@ export default function Home() {
           <button className="reset-button" onClick={resetBoard}>
             Сбросить карту
           </button>
+          {apiEnabled() && (
+            <>
+              {session && (
+                <span
+                  className={`sync-indicator ${syncStatus}`}
+                  title={
+                    syncStatus === "syncing"
+                      ? "Сохранение изменений…"
+                      : syncStatus === "error"
+                        ? "Ошибка синхронизации — изменения останутся локально"
+                        : "Отметки синхронизированы"
+                  }
+                >
+                  <i />
+                  <span>
+                    {syncStatus === "syncing"
+                      ? "Сохранение…"
+                      : syncStatus === "error"
+                        ? "Ошибка синхронизации"
+                        : "Синхронизировано"}
+                  </span>
+                </span>
+              )}
+              <button
+                type="button"
+                className={`user-button ${session ? "user-button-authed" : ""}`}
+                onClick={() => (session ? void handleLogout() : setAuthOpen(true))}
+                aria-label={session ? `Выйти (${session.user.name})` : "Войти для синхронизации"}
+                title={session ? `Синхронизация включена · ${session.user.name}` : "Войти для синхронизации"}
+              >
+                <span className="user-avatar">
+                  {session ? session.user.name.slice(0, 1).toUpperCase() : "↗"}
+                </span>
+                <b>{session ? session.user.name.split(" ")[0] : "Войти"}</b>
+              </button>
+            </>
+          )}
         </div>
       </header>
 
@@ -613,8 +817,9 @@ export default function Home() {
 
           {orderedItems.map((item, index) => {
             const x = getItemX(index);
-            const y = getItemY(index);
+            const y = getItemY(item, index);
             const above = y < TIMELINE_Y;
+            const axisOffset = TIMELINE_Y - y;
             const phase = item.phase ? PHASES.find((entry) => entry.id === item.phase) : null;
             const matched = matchingIds.has(item.id);
             const isWatched = watched.includes(item.id);
@@ -626,103 +831,41 @@ export default function Home() {
             const mainChars = item.media.characters
               .filter((a) => a.role === "main" || a.role === "supporting")
               .map((a) => a.characterId);
-            const borderShadow = characterBorderShadow(mainChars, colorById);
+            const glowLayers = characterGlowLayers(mainChars, colorById);
             const caption = formatCardCaption(item, mode, phase?.label);
-            const dimmedByCharacter = selectedCharacterId && !inSelected;
-            const posterSrc = posterLink(item, overrides.posterOverrides[item.id]);
+            const dimmedByCharacter = Boolean(selectedCharacterId && !inSelected);
+            const highlighted = Boolean(selectedCharacterId && inSelected);
+            const posterSrc = posterLink(
+              { id: item.id, posterPath: item.media.posterPath },
+              overrides.posterOverrides[item.id],
+            );
             const announced = item.media.canonStatus === "announced";
 
             return (
-              <motion.article
+              <MovieCard
                 key={item.id}
-                className={`movie-node ${above ? "above" : "below"} ${matched && !dimmedByCharacter ? "matched" : "muted"} ${isWatched ? "watched" : ""} ${announced ? "announced" : ""} ${selectedMediaId === item.id ? "editor-selected" : ""}`}
-                initial={false}
-                animate={{ left: x, top: y }}
-                transition={{ type: "spring", stiffness: 120, damping: 20 }}
-                style={
-                  {
-                    "--phase": phase?.color ?? "#8d96a8",
-                    boxShadow: borderShadow,
-                  } as React.CSSProperties
-                }
-                onClick={() => {
-                  if (editMode) setSelectedMediaId(item.id);
-                }}
-              >
-                <span className="connector" />
-                <span className="timeline-dot">
-                  <i />
-                </span>
-                <div className="movie-order">{String(index + 1).padStart(2, "0")}</div>
-                <div className="poster-shell">
-                  {link ? (
-                    <a
-                      className="poster-link"
-                      href={link}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      draggable={false}
-                      onClick={(event) => {
-                        if (!suppressPosterClickRef.current) return;
-                        event.preventDefault();
-                        event.stopPropagation();
-                        suppressPosterClickRef.current = false;
-                      }}
-                      aria-label={`Открыть страницу «${item.title}» на SSpoisk`}
-                    >
-                      <Poster title={item.title} original={item.original} src={posterSrc} />
-                      <span className="play-orbit">
-                        <b>▶</b>
-                      </span>
-                    </a>
-                  ) : (
-                    <div className="poster-link poster-link-static" aria-label={`Постер «${item.title}»`}>
-                      <Poster title={item.title} original={item.original} src={posterSrc} />
-                    </div>
-                  )}
-                  <label
-                    className="watched-control"
-                    title={isWatched ? "Отмечено как просмотренное" : "Отметить как просмотренное"}
-                    onPointerDown={(event) => event.stopPropagation()}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={isWatched}
-                      onChange={() => toggleWatched(item.id)}
-                    />
-                    <i aria-hidden="true">✓</i>
-                    <span>{isWatched ? "Просмотрено" : "Отметить просмотренным"}</span>
-                  </label>
-                </div>
-                <div className="movie-copy">
-                  <span>{caption}</span>
-                  <h3>{item.title}</h3>
-                  <p>{item.original}</p>
-                  {link && (
-                    <button
-                      className="copy-watch-button"
-                      type="button"
-                      disabled={copyingMovie === item.id}
-                      onClick={() =>
-                        copyMovieAnnouncement({
-                          id: item.id,
-                          title: item.title,
-                          year: item.year,
-                        })
-                      }
-                      aria-label={`Скопировать текст и постер «${item.title}»`}
-                      title={copyingMovie === item.id ? "Готовим постер…" : "Скопировать текст и постер"}
-                    >
-                      <span className="copy-glyph" aria-hidden="true">
-                        <svg viewBox="0 0 24 24" fill="none">
-                          <rect x="8" y="8" width="11" height="11" rx="2" />
-                          <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
-                        </svg>
-                      </span>
-                    </button>
-                  )}
-                </div>
-              </motion.article>
+                item={item}
+                order={index + 1}
+                x={x}
+                y={y}
+                above={above}
+                axisOffset={axisOffset}
+                phaseColor={phase?.color ?? "#8d96a8"}
+                dimmed={!matched || dimmedByCharacter}
+                highlighted={highlighted}
+                isWatched={isWatched}
+                announced={announced}
+                editorSelected={selectedMediaId === item.id}
+                glowLayers={glowLayers}
+                caption={caption}
+                link={link}
+                posterSrc={posterSrc}
+                copying={copyingMovie === item.id}
+                suppressPosterClickRef={suppressPosterClickRef}
+                onToggleWatched={toggleWatched}
+                onCopy={copyMovieAnnouncement}
+                onSelectMedia={handleSelectMedia}
+              />
             );
           })}
         </div>
@@ -749,7 +892,7 @@ export default function Home() {
       <div className="zoom-control">
         <button
           onClick={() =>
-            setView((current) => ({ ...current, scale: Math.max(0.28, current.scale - 0.1) }))
+            setView((current) => ({ ...current, scale: Math.max(0.12, current.scale - 0.1) }))
           }
           aria-label="Уменьшить"
         >
@@ -825,6 +968,15 @@ export default function Home() {
           </section>
         </div>
       )}
+
+      <AuthModal
+        open={authOpen}
+        onClose={() => setAuthOpen(false)}
+        onAuthed={(token, user, serverItems) => {
+          applyRemoteSession(token, user, serverItems ?? {});
+          setToast(`Вы вошли как ${user.name || user.email}`);
+        }}
+      />
     </main>
   );
 }

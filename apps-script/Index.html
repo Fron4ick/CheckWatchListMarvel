@@ -1,10 +1,12 @@
 <!DOCTYPE html>
 <html lang="ru">
+
 <head>
   <base target="_blank">
   <meta charset="utf-8">
   <?!= include('Styles'); ?>
 </head>
+
 <body>
   <div id="loading" class="gate-screen">
     <div class="gate-card loading-card">
@@ -32,7 +34,10 @@
       <div class="brand-block">
         <span class="marvel-mark">MARVEL<span class="creator-sticker">by GUACAMOLEMOLLY</span></span>
         <span class="brand-divider"></span>
-        <div><h1>Timeline Board</h1><p id="progressText">0 из 38 просмотрено · общая карта</p></div>
+        <div>
+          <h1>Timeline Board</h1>
+          <p id="progressText">0 из 38 просмотрено · общая карта</p>
+        </div>
       </div>
 
       <div class="search-wrap">
@@ -43,7 +48,8 @@
 
       <div class="top-actions">
         <div class="sync-indicator" id="syncIndicator"><i></i><span>Синхронизировано</span></div>
-        <button id="userButton" class="user-button" aria-label="Пользователь"><span id="userInitial">G</span><b id="userName">Google</b></button>
+        <button id="userButton" class="user-button" aria-label="Пользователь"><span id="userInitial">G</span><b
+            id="userName">Google</b></button>
         <button id="helpButton" class="round-button" aria-label="Как пользоваться">?</button>
       </div>
     </header>
@@ -53,10 +59,13 @@
     <aside id="toolbox" class="toolbox open" aria-label="Инструменты карты">
       <button id="collapseTools" class="collapse" aria-label="Свернуть инструменты">‹</button>
       <div class="toolbox-title">СОЗДАТЬ</div>
-      <button class="tool-button active" data-tool="select"><span class="tool-icon">↖</span><span class="tool-label">Выбор</span><kbd>V</kbd></button>
+      <button class="tool-button active" data-tool="select"><span class="tool-icon">↖</span><span
+          class="tool-label">Выбор</span><kbd>V</kbd></button>
       <span class="tool-separator"></span>
-      <button class="tool-button" data-tool="text"><span class="tool-icon">T</span><span class="tool-label">Текст</span><kbd>T</kbd></button>
-      <button class="tool-button" data-tool="image"><span class="tool-icon">▧</span><span class="tool-label">Фото</span><kbd>I</kbd></button>
+      <button class="tool-button" data-tool="text"><span class="tool-icon">T</span><span
+          class="tool-label">Текст</span><kbd>T</kbd></button>
+      <button class="tool-button" data-tool="image"><span class="tool-icon">▧</span><span
+          class="tool-label">Фото</span><kbd>I</kbd></button>
       <input id="photoInput" type="file" accept="image/jpeg,image/png,image/webp" hidden>
     </aside>
 
@@ -75,9 +84,11 @@
     </div>
 
     <div class="zoom-control">
-      <button id="zoomOut" aria-label="Уменьшить">−</button><span id="zoomValue">72%</span><button id="zoomIn" aria-label="Увеличить">+</button>
+      <button id="zoomOut" aria-label="Уменьшить">−</button><span id="zoomValue">72%</span><button id="zoomIn"
+        aria-label="Увеличить">+</button>
     </div>
-    <div class="board-status"><span class="live-dot"></span><span id="statusText">Общая карта Google</span><kbd>колесо</kbd><span>масштаб под курсором</span></div>
+    <div class="board-status"><span class="live-dot"></span><span id="statusText">Общая карта
+        Google</span><kbd>колесо</kbd><span>масштаб под курсором</span></div>
     <div id="toast" class="toast" role="status" hidden></div>
   </main>
 
@@ -87,9 +98,18 @@
       <span class="modal-kicker">КАК ЭТО РАБОТАЕТ</span>
       <h2 id="helpTitle">Ваша общая киновселенная</h2>
       <div class="help-grid">
-        <div><b>01</b><h3>Исследуйте</h3><p>Тяните карту и масштабируйте её колесом. Фазы идут слева направо.</p></div>
-        <div><b>02</b><h3>Дополняйте</h3><p>Фото, заметки и отметки сразу сохраняются в общей Google-карте.</p></div>
-        <div><b>03</b><h3>Работайте вместе</h3><p>Изменения второго участника появляются автоматически, пока карта открыта.</p></div>
+        <div><b>01</b>
+          <h3>Исследуйте</h3>
+          <p>Тяните карту и масштабируйте её колесом. Фазы идут слева направо.</p>
+        </div>
+        <div><b>02</b>
+          <h3>Дополняйте</h3>
+          <p>Фото, заметки и отметки сразу сохраняются в общей Google-карте.</p>
+        </div>
+        <div><b>03</b>
+          <h3>Работайте вместе</h3>
+          <p>Изменения второго участника появляются автоматически, пока карта открыта.</p>
+        </div>
       </div>
       <button class="primary-button" data-close-modal="helpModal">Продолжить</button>
     </section>
@@ -113,26 +133,27 @@
           <button id="resetBoard" class="danger-button">Очистить общую карту</button>
         </div>
       </div>
-      <p id="memberNote" class="member-note">Доступ к карте выдан владельцем. Управлять участниками может только владелец.</p>
+      <p id="memberNote" class="member-note">Доступ к карте выдан владельцем. Управлять участниками может только
+        владелец.</p>
     </section>
   </div>
 
   <script>
     window.__marvelClientLoaded = false;
     window.__marvelBootFinished = false;
-    window.__marvelDiagnostic = function(message) {
+    window.__marvelDiagnostic = function (message) {
       var status = document.getElementById("loadingStatus");
       if (status) status.textContent = message;
     };
-    window.addEventListener("error", function(event) {
+    window.addEventListener("error", function (event) {
       var location = event.lineno ? " · строка " + event.lineno + (event.colno ? ":" + event.colno : "") : "";
       window.__marvelDiagnostic("Ошибка интерфейса: " + (event.message || "неизвестная ошибка") + location);
     });
-    window.addEventListener("unhandledrejection", function(event) {
+    window.addEventListener("unhandledrejection", function (event) {
       var reason = event.reason && event.reason.message ? event.reason.message : String(event.reason || "неизвестная ошибка");
       window.__marvelDiagnostic("Ошибка запуска: " + reason);
     });
-    window.setTimeout(function() {
+    window.setTimeout(function () {
       if (window.__marvelBootFinished) return;
       window.__marvelDiagnostic(window.__marvelClientLoaded
         ? "Сервер Google не ответил. Откройте «Выполнения» в Apps Script и обновите страницу."
@@ -141,4 +162,5 @@
   </script>
   <script src="https://cdn.jsdelivr.net/gh/Qudy8/MarvelMarka@037a803/public/apps-script-client.js"></script>
 </body>
+
 </html>

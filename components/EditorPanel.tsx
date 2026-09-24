@@ -81,9 +81,9 @@ export function EditorPanel({
     const neu: Character = {
       id,
       name: "Новый персонаж",
-      actors: [{ actor: "TODO", period: "—" }],
+      actors: [{ actor: "Не указан", period: "—" }],
       appearances: [],
-      biography: "TODO: краткая биография",
+      biography: "Биография пока не заполнена.",
       color: "#888888",
       lineWidth: 3,
     };

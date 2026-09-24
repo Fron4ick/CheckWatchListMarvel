@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // Статический экспорт для хостинга на Yandex Cloud Object Storage.
+  output: "export",
+  trailingSlash: true,
 };
 
 export default nextConfig;

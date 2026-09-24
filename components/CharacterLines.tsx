@@ -1,9 +1,9 @@
 "use client";
 
-import { memo, useMemo } from "react";
+import { memo, useMemo, type ReactNode } from "react";
 import type { Character } from "@/data/types";
 import type { CardRect } from "@/lib/layout";
-import { routeCharacterPath } from "@/lib/routing";
+import { buildCharacterLines } from "@/lib/routing";
 
 type Props = {
   characters: Character[];
@@ -22,42 +22,44 @@ function CharacterLinesInner({
   selectedId,
   onSelect,
 }: Props) {
-  const paths = useMemo(() => {
+  const built = useMemo(() => {
     const hidden = new Set(hiddenIds);
-    return characters
-      .filter((c) => !hidden.has(c.id) && c.lineWidth >= 2)
-      .map((character) => {
-        const appearanceIds = character.appearances.filter((id) => rects.has(id));
-        // Keep board order for path direction
-        const orderedAppearances = orderedIds.filter((id) =>
-          appearanceIds.includes(id),
-        );
-        const d = routeCharacterPath(orderedAppearances, rects, orderedIds);
-        return { character, d, orderedAppearances };
-      })
-      .filter((p) => p.d);
+    const visible = characters.filter(
+      (c) => !hidden.has(c.id) && c.lineWidth >= 2,
+    );
+    return buildCharacterLines(
+      visible.map((c) => ({
+        id: c.id,
+        appearances: c.appearances,
+        lineWidth: c.lineWidth,
+      })),
+      orderedIds,
+      rects,
+    );
   }, [characters, orderedIds, rects, hiddenIds]);
 
-  return (
-    <svg
-      className="character-lines-layer"
-      width="100%"
-      height="100%"
-      aria-hidden={false}
-      style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "visible" }}
-    >
-      {paths.map(({ character, d }) => {
-        const isSelected = selectedId === character.id;
-        const dimmed = selectedId !== null && !isSelected;
-        const width = Math.max(1.5, character.lineWidth * 0.85);
-        return (
-          <g key={character.id}>
-            {/* Wider invisible hit area */}
+  const renderItems = useMemo(() => {
+    const charById = new Map(characters.map((c) => [c.id, c]));
+    const items: Array<{ z: number; node: ReactNode }> = [];
+
+    // Линии: тонкие ниже, толстые выше (z = индекс в built.lines).
+    built.lines.forEach((line, z) => {
+      const character = charById.get(line.id);
+      if (!character) return;
+      const isSelected = selectedId === line.id;
+      const dimmed = selectedId !== null && !isSelected;
+      // Удвоенная толщина линии по запросу пользователя.
+      const width = Math.max(3, character.lineWidth * 1.7);
+      items.push({
+        z,
+        node: (
+          <g key={line.id}>
+            {/* Расширенная невидимая зона клика */}
             <path
-              d={d!}
+              d={line.d}
               fill="none"
               stroke="transparent"
-              strokeWidth={Math.max(14, width + 10)}
+              strokeWidth={Math.max(18, width + 12)}
               style={{ pointerEvents: "stroke", cursor: "pointer" }}
               onClick={(e) => {
                 e.stopPropagation();
@@ -74,7 +76,7 @@ function CharacterLinesInner({
               }}
             />
             <path
-              d={d!}
+              d={line.d}
               fill="none"
               stroke={character.color}
               strokeWidth={width}
@@ -82,11 +84,45 @@ function CharacterLinesInner({
               strokeLinejoin="round"
               opacity={dimmed ? 0.08 : isSelected ? 1 : 0.72}
               style={{ pointerEvents: "none", transition: "opacity .25s ease" }}
-              filter={isSelected ? `drop-shadow(0 0 6px ${character.color})` : undefined}
+              filter={
+                isSelected ? `drop-shadow(0 0 6px ${character.color})` : undefined
+              }
             />
           </g>
-        );
-      })}
+        ),
+      });
+    });
+
+    // Тёмные «мостики» на пересечениях: кладём строго между нижней и верхней линиями.
+    built.bridges.forEach((bridge, k) => {
+      items.push({
+        z: bridge.z,
+        node: (
+          <path
+            key={`bridge-${k}`}
+            d={`M ${bridge.x - bridge.dx * bridge.half} ${bridge.y - bridge.dy * bridge.half} L ${bridge.x + bridge.dx * bridge.half} ${bridge.y + bridge.dy * bridge.half}`}
+            fill="none"
+            stroke="rgba(4, 7, 14, 0.92)"
+            strokeWidth={bridge.width}
+            strokeLinecap="round"
+            style={{ pointerEvents: "none" }}
+          />
+        ),
+      });
+    });
+
+    return items.sort((a, b) => a.z - b.z);
+  }, [built, characters, selectedId, onSelect]);
+
+  return (
+    <svg
+      className="character-lines-layer"
+      width="100%"
+      height="100%"
+      aria-hidden={false}
+      style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "visible" }}
+    >
+      {renderItems.map((item) => item.node)}
     </svg>
   );
 }
